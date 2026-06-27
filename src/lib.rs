@@ -274,7 +274,7 @@ fn run_fingerprint_auth(
             break;
         }
 
-        let VerifyStatus((result, done)) = signal;
+        let (result, done) = signal.args()?;
 
         match result.as_str() {
             "verify-match" => {
