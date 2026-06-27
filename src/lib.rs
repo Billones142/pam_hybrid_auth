@@ -128,7 +128,7 @@ unsafe extern "C" fn sigusr1_handler(_sig: libc::c_int) {
 
 unsafe fn setup_sigusr1_handler() {
     let mut sa: libc::sigaction = std::mem::zeroed();
-    sa.sa_sigaction = sigusr1_handler as usize;
+    sa.sa_sigaction = sigusr1_handler as *const () as usize;
     sa.sa_flags = 0; // Ensure SA_RESTART is NOT set so we trigger EINTR
     libc::sigemptyset(&mut sa.sa_mask);
 
@@ -140,7 +140,7 @@ unsafe fn setup_sigusr1_handler() {
 unsafe fn restore_sigusr1_handler() {
     libc::sigaction(
         libc::SIGUSR1,
-        &ORIGINAL_SIGUSR1_HANDLER,
+        std::ptr::addr_of!(ORIGINAL_SIGUSR1_HANDLER),
         std::ptr::null_mut(),
     );
 }
@@ -274,9 +274,10 @@ fn run_fingerprint_auth(
             break;
         }
 
-        let (result, done) = signal.args()?;
+        let args = signal.args()?;
+        let result_str: &str = &args.result;
 
-        match result.as_str() {
+        match result_str {
             "verify-match" => {
                 auth_success.store(true, Ordering::SeqCst);
                 // Busy wait briefly if the password thread ID is not written yet
@@ -292,12 +293,12 @@ fn run_fingerprint_auth(
                 return Ok(true);
             }
             "verify-no-match" => {
-                if done {
+                if args.done {
                     break;
                 }
             }
             _ => {
-                if done {
+                if args.done {
                     break;
                 }
             }
