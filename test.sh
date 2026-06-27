@@ -19,17 +19,15 @@ fi
 TEST_USER=$(logname 2>/dev/null || echo $USER)
 
 # Detect PAM module location
-# Find where the compiled .so is or where it will be installed
-# We check the default locations based on OS
-if [ -d "/lib/x86_64-linux-gnu/security" ]; then
-    PAM_DIR="/lib/x86_64-linux-gnu/security"
+if [ -f "target/release/libpam_password_fingerprint.so" ]; then
+    PAM_MODULE_PATH="$(pwd)/target/release/libpam_password_fingerprint.so"
+elif [ -f "/lib/x86_64-linux-gnu/security/$PAM_MODULE_NAME" ]; then
+    PAM_MODULE_PATH="/lib/x86_64-linux-gnu/security/$PAM_MODULE_NAME"
+elif [ -f "/lib/security/$PAM_MODULE_NAME" ]; then
+    PAM_MODULE_PATH="/lib/security/$PAM_MODULE_NAME"
 else
-    PAM_DIR="/lib/security"
-fi
-
-if [ ! -f "$PAM_DIR/$PAM_MODULE_NAME" ] && [ ! -f "target/release/libpam_password_fingerprint.so" ]; then
     echo "Warning: PAM module has not been built or installed yet."
-    echo "Please run 'make' to build it, and then 'sudo make install' to install it first."
+    echo "Please run 'make' to build it first."
     exit 1
 fi
 
@@ -39,7 +37,7 @@ echo "This requires sudo privileges. Creating config..."
 # Setup temporary PAM config
 sudo bash -c "cat > $PAM_CONF_PATH" <<EOF
 # PAM configuration for testing pam_password_fingerprint
-auth required $PAM_MODULE_NAME
+auth required $PAM_MODULE_PATH
 account required pam_permit.so
 EOF
 
