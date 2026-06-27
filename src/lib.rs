@@ -364,30 +364,46 @@ async fn run_fingerprint_auth(
     }
 
     let mut claimed = false;
-    for attempt in 1..=6 {
-        if auth_success.load(Ordering::SeqCst) {
-            return Ok(false);
+    match device.claim(username).await {
+        Ok(_) => {
+            claimed = true;
         }
-        match device.claim(username).await {
-            Ok(_) => {
-                claimed = true;
-                break;
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("AlreadyInUse") && attempt < 6 {
-                    syslog_log(
-                        libc::LOG_DEBUG,
-                        &format!(
-                            "[+{:?}] Device already claimed, retrying in 50ms (attempt {}/5)...",
-                            start_time.elapsed(),
-                            attempt
-                        ),
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("AlreadyInUse") {
+                // Print the RED warning message immediately to the user
+                if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+                    use std::io::Write;
+                    eprint!("\r\x1b[2K\x1b[31m[PAM] Fingerprint reader is busy (already claimed).\x1b[0m\nPassword: ");
+                    let _ = std::io::stderr().flush();
+                }
+
+                // Start retrying in the background every 10ms for up to 30 times (300ms total)
+                let mut success = false;
+                for _attempt in 1..=30 {
+                    if auth_success.load(Ordering::SeqCst) {
+                        return Ok(false);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    if device.claim(username).await.is_ok() {
+                        claimed = true;
+                        success = true;
+                        break;
+                    }
+                }
+
+                if success {
+                    // Success! Print the GREEN reconnected message, converting the warning in-place
+                    if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+                        use std::io::Write;
+                        eprint!("\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[32m[PAM] Fingerprint scanner reconnected.\x1b[0m\nPassword: ");
+                        let _ = std::io::stderr().flush();
+                    }
                 } else {
                     return Err(e.into());
                 }
+            } else {
+                return Err(e.into());
             }
         }
     }
@@ -604,18 +620,18 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
             if let Err(e) = res {
                 let err_str = e.to_string();
-                let user_msg = if err_str.contains("AlreadyInUse") {
-                    "Fingerprint reader is busy (already claimed)."
-                } else if err_str.contains("PermissionDenied") {
-                    "Permission denied accessing fingerprint reader."
-                } else {
-                    "Fingerprint reader initialization failed."
-                };
+                if !err_str.contains("AlreadyInUse") {
+                    let user_msg = if err_str.contains("PermissionDenied") {
+                        "Permission denied accessing fingerprint reader."
+                    } else {
+                        "Fingerprint reader initialization failed."
+                    };
 
-                if libc::isatty(libc::STDERR_FILENO) != 0 {
-                    use std::io::Write;
-                    eprint!("\r\x1b[2K[PAM] {}\nPassword: ", user_msg);
-                    let _ = std::io::stderr().flush();
+                    if libc::isatty(libc::STDERR_FILENO) != 0 {
+                        use std::io::Write;
+                        eprint!("\r\x1b[2K\x1b[31m[PAM] {}\x1b[0m\nPassword: ", user_msg);
+                        let _ = std::io::stderr().flush();
+                    }
                 }
 
                 if !auth_success.load(Ordering::SeqCst) {
