@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 libc = "0.2"
-zbus = { version = "4", features = ["blocking-api"] }
+zbus = { version = "4", features = ["blocking"] }
