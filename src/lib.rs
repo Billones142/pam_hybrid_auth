@@ -250,22 +250,12 @@ fn get_shadow_hash(username: &str) -> Result<String, String> {
 
 // --- Verification Logic ---
 
-fn check_fingerprint_enrolled(username: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    let conn = Connection::system()?;
-    let manager = FprintManagerProxyBlocking::new(&conn)?;
-    let device_path = manager.get_default_device()?;
-    let device = FprintDeviceProxyBlocking::builder(&conn)
-        .path(device_path)?
-        .build()?;
-    let enrolled = device.list_enrolled_fingers(username)?;
-    Ok(!enrolled.is_empty())
-}
-
 fn run_fingerprint_auth(
-    device: &FprintDeviceProxyBlocking,
+    username: &str,
     auth_success: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
     fp_thread_id: &Mutex<Option<libc::pthread_t>>,
+    conn_shared: &Mutex<Option<Connection>>,
     start_time: std::time::Instant,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let self_id = unsafe { libc::pthread_self() };
@@ -273,9 +263,86 @@ fn run_fingerprint_auth(
 
     syslog_log(
         libc::LOG_DEBUG,
+        &format!("[+{:?}] Fingerprint thread: starting DBus connection...", start_time.elapsed()),
+    );
+
+    if auth_success.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    let conn = Connection::system()?;
+    *conn_shared.lock().unwrap() = Some(conn.clone());
+
+    if auth_success.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    let manager = FprintManagerProxyBlocking::new(&conn)?;
+
+    if auth_success.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    let device_path = manager.get_default_device()?;
+
+    if auth_success.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    let device = FprintDeviceProxyBlocking::builder(&conn)
+        .path(device_path)?
+        .build()?;
+
+    // Check if enrolled
+    let enrolled = device.list_enrolled_fingers(username)?;
+    if enrolled.is_empty() {
+        syslog_log(
+            libc::LOG_INFO,
+            &format!("[+{:?}] Fingerprint thread: no enrolled fingers, exiting.", start_time.elapsed()),
+        );
+        return Ok(false);
+    }
+
+    // Set up cleanup guard
+    struct DeviceReleaser<'a> {
+        device: &'a FprintDeviceProxyBlocking<'a>,
+        claimed: bool,
+        started: bool,
+    }
+    impl<'a> Drop for DeviceReleaser<'a> {
+        fn drop(&mut self) {
+            if self.started {
+                let _ = self.device.verify_stop();
+            }
+            if self.claimed {
+                let _ = self.device.release();
+            }
+        }
+    }
+
+    let mut guard = DeviceReleaser {
+        device: &device,
+        claimed: false,
+        started: false,
+    };
+
+    if auth_success.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    device.claim(username)?;
+    guard.claimed = true;
+
+    if auth_success.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    syslog_log(
+        libc::LOG_DEBUG,
         &format!("[+{:?}] Fingerprint thread: starting VerifyStart...", start_time.elapsed()),
     );
     device.verify_start("any")?;
+    guard.started = true;
     syslog_log(
         libc::LOG_DEBUG,
         &format!("[+{:?}] Fingerprint thread: VerifyStart completed. Waiting for signals...", start_time.elapsed()),
@@ -335,7 +402,7 @@ fn run_password_auth(
     auth_success: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
     fp_thread_id: &Mutex<Option<libc::pthread_t>>,
-    device: Option<&FprintDeviceProxyBlocking>,
+    conn_shared: &Mutex<Option<Connection>>,
     start_time: std::time::Instant,
 ) {
     let self_id = unsafe { libc::pthread_self() };
@@ -369,9 +436,9 @@ fn run_password_auth(
                     &format!("[+{:?}] Password thread: verification failed.", start_time.elapsed()),
                 );
             }
-            // Stop fingerprint scanner if it was running
-            if let Some(dev) = device {
-                let _ = dev.verify_stop();
+            // Close the D-Bus connection to force unblock the fingerprint thread
+            if let Some(conn) = conn_shared.lock().unwrap().take() {
+                let _ = conn.close();
             }
             // Signal fingerprint thread to wake up and exit
             let tid_opt = *fp_thread_id.lock().unwrap();
@@ -390,8 +457,9 @@ fn run_password_auth(
                     err
                 ),
             );
-            if let Some(dev) = device {
-                let _ = dev.verify_stop();
+            // Close the D-Bus connection to force unblock the fingerprint thread
+            if let Some(conn) = conn_shared.lock().unwrap().take() {
+                let _ = conn.close();
             }
             // Signal fingerprint thread to wake up and exit
             let tid_opt = *fp_thread_id.lock().unwrap();
@@ -403,8 +471,6 @@ fn run_password_auth(
         }
     }
 }
-
-// --- Main PAM Sm Entrypoints ---
 
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_authenticate(
@@ -438,135 +504,23 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         &format!("[+0.0ms] pam_sm_authenticate started for user: {}", username),
     );
 
-    // Check if fingerprint scanner is available and has enrolled fingers
-    let fp_available = match check_fingerprint_enrolled(&username) {
-        Ok(available) => available,
-        Err(e) => {
-            syslog_log(
-                libc::LOG_DEBUG,
-                &format!(
-                    "[+{:?}] Fingerprint reader check failed: {}",
-                    start_time.elapsed(),
-                    e
-                ),
-            );
-            false
-        }
-    };
-
-    if !fp_available {
-        syslog_log(
-            libc::LOG_INFO,
-            &format!(
-                "[+{:?}] Fingerprint authentication not available; falling back to password.",
-                start_time.elapsed()
-            ),
-        );
-        let prompt_res = prompt_password(pamh, "Password: ");
-        return match prompt_res {
-            Ok(password) => {
-                if verify_password_hash(&password, &shadow_hash) {
-                    PAM_SUCCESS
-                } else {
-                    PAM_AUTH_ERR
-                }
-            }
-            Err(err) => err,
-        };
-    }
-
-    // Initialize DBus connection for fprintd
-    let conn = match Connection::system() {
-        Ok(c) => c,
-        Err(e) => {
-            syslog_log(
-                libc::LOG_ERR,
-                &format!(
-                    "[+{:?}] Failed to connect to system bus: {}",
-                    start_time.elapsed(),
-                    e
-                ),
-            );
-            return PAM_SYSTEM_ERR;
-        }
-    };
-
-    let manager = match FprintManagerProxyBlocking::new(&conn) {
-        Ok(m) => m,
-        Err(e) => {
-            syslog_log(
-                libc::LOG_ERR,
-                &format!(
-                    "[+{:?}] Failed to instantiate Fprint Manager proxy: {}",
-                    start_time.elapsed(),
-                    e
-                ),
-            );
-            return PAM_SYSTEM_ERR;
-        }
-    };
-
-    let device_path = match manager.get_default_device() {
-        Ok(path) => path,
-        Err(e) => {
-            syslog_log(
-                libc::LOG_ERR,
-                &format!(
-                    "[+{:?}] Failed to get default fprint device: {}",
-                    start_time.elapsed(),
-                    e
-                ),
-            );
-            return PAM_SYSTEM_ERR;
-        }
-    };
-
-    let device = match FprintDeviceProxyBlocking::builder(&conn)
-        .path(device_path)
-        .unwrap()
-        .build()
-    {
-        Ok(dev) => dev,
-        Err(e) => {
-            syslog_log(
-                libc::LOG_ERR,
-                &format!(
-                    "[+{:?}] Failed to build Fprint Device proxy: {}",
-                    start_time.elapsed(),
-                    e
-                ),
-            );
-            return PAM_SYSTEM_ERR;
-        }
-    };
-
-    if let Err(e) = device.claim(&username) {
-        syslog_log(
-            libc::LOG_ERR,
-            &format!(
-                "[+{:?}] Failed to claim fprint device: {}",
-                start_time.elapsed(),
-                e
-            ),
-        );
-        return PAM_SYSTEM_ERR;
-    }
-
     setup_sigusr1_handler();
 
     let auth_success = AtomicBool::new(false);
     let pw_thread_id = Mutex::new(None);
     let fp_thread_id = Mutex::new(None);
+    let conn_shared = Mutex::new(None);
     let pamh_usize = pamh as usize;
 
     std::thread::scope(|s| {
         // Spawn fingerprint authentication thread
         s.spawn(|| {
             if let Err(e) = run_fingerprint_auth(
-                &device,
+                &username,
                 &auth_success,
                 &pw_thread_id,
                 &fp_thread_id,
+                &conn_shared,
                 start_time,
             ) {
                 if !auth_success.load(Ordering::SeqCst) {
@@ -590,18 +544,17 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &auth_success,
                 &pw_thread_id,
                 &fp_thread_id,
-                Some(&device),
+                &conn_shared,
                 start_time,
             );
         });
     });
 
     restore_sigusr1_handler();
-    let _ = device.release();
     syslog_log(
         libc::LOG_INFO,
         &format!(
-            "[+{:?}] Thread scope joined, device released.",
+            "[+{:?}] Thread scope joined.",
             start_time.elapsed()
         ),
     );
