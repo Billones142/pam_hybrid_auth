@@ -274,7 +274,9 @@ fn run_fingerprint_auth(
             break;
         }
 
-        match signal.result.as_str() {
+        let VerifyStatus(result, done) = signal;
+
+        match result.as_str() {
             "verify-match" => {
                 auth_success.store(true, Ordering::SeqCst);
                 // Busy wait briefly if the password thread ID is not written yet
@@ -290,12 +292,12 @@ fn run_fingerprint_auth(
                 return Ok(true);
             }
             "verify-no-match" => {
-                if signal.done {
+                if done {
                     break;
                 }
             }
             _ => {
-                if signal.done {
+                if done {
                     break;
                 }
             }
