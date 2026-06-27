@@ -265,8 +265,21 @@ fn run_fingerprint_auth(
     device: &FprintDeviceProxyBlocking,
     auth_success: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
+    fp_thread_id: &Mutex<Option<libc::pthread_t>>,
+    start_time: std::time::Instant,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let self_id = unsafe { libc::pthread_self() };
+    *fp_thread_id.lock().unwrap() = Some(self_id);
+
+    syslog_log(
+        libc::LOG_DEBUG,
+        &format!("[+{:?}] Fingerprint thread: starting VerifyStart...", start_time.elapsed()),
+    );
     device.verify_start("any")?;
+    syslog_log(
+        libc::LOG_DEBUG,
+        &format!("[+{:?}] Fingerprint thread: VerifyStart completed. Waiting for signals...", start_time.elapsed()),
+    );
 
     let iter = device.receive_verify_status()?;
     for signal in iter {
@@ -276,6 +289,15 @@ fn run_fingerprint_auth(
 
         let args = signal.args()?;
         let result_str: &str = &args.result;
+        syslog_log(
+            libc::LOG_DEBUG,
+            &format!(
+                "[+{:?}] Fingerprint signal received: {}, done: {}",
+                start_time.elapsed(),
+                result_str,
+                args.done
+            ),
+        );
 
         match result_str {
             "verify-match" => {
@@ -312,33 +334,71 @@ fn run_password_auth(
     shadow_hash: &str,
     auth_success: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
+    fp_thread_id: &Mutex<Option<libc::pthread_t>>,
     device: Option<&FprintDeviceProxyBlocking>,
+    start_time: std::time::Instant,
 ) {
     let self_id = unsafe { libc::pthread_self() };
     *pw_thread_id.lock().unwrap() = Some(self_id);
 
+    syslog_log(
+        libc::LOG_DEBUG,
+        &format!("[+{:?}] Password thread: prompt starting...", start_time.elapsed()),
+    );
     let prompt_res = unsafe { prompt_password(pamh, "Password: ") };
+    syslog_log(
+        libc::LOG_DEBUG,
+        &format!("[+{:?}] Password thread: prompt returned.", start_time.elapsed()),
+    );
 
     match prompt_res {
         Ok(password) => {
+            syslog_log(
+                libc::LOG_DEBUG,
+                &format!("[+{:?}] Password thread: crypt verification starting...", start_time.elapsed()),
+            );
             if verify_password_hash(&password, shadow_hash) {
                 auth_success.store(true, Ordering::SeqCst);
-                syslog_log(libc::LOG_INFO, "Password verification successful.");
+                syslog_log(
+                    libc::LOG_INFO,
+                    &format!("[+{:?}] Password thread: verification successful.", start_time.elapsed()),
+                );
             } else {
-                syslog_log(libc::LOG_WARNING, "Password verification failed.");
+                syslog_log(
+                    libc::LOG_WARNING,
+                    &format!("[+{:?}] Password thread: verification failed.", start_time.elapsed()),
+                );
             }
             // Stop fingerprint scanner if it was running
             if let Some(dev) = device {
                 let _ = dev.verify_stop();
             }
+            // Signal fingerprint thread to wake up and exit
+            let tid_opt = *fp_thread_id.lock().unwrap();
+            if let Some(tid) = tid_opt {
+                unsafe {
+                    libc::pthread_kill(tid, libc::SIGUSR1);
+                }
+            }
         }
         Err(err) => {
             syslog_log(
                 libc::LOG_DEBUG,
-                &format!("Password prompt interrupted or failed: {}", err),
+                &format!(
+                    "[+{:?}] Password thread: prompt interrupted or failed: {}",
+                    start_time.elapsed(),
+                    err
+                ),
             );
             if let Some(dev) = device {
                 let _ = dev.verify_stop();
+            }
+            // Signal fingerprint thread to wake up and exit
+            let tid_opt = *fp_thread_id.lock().unwrap();
+            if let Some(tid) = tid_opt {
+                unsafe {
+                    libc::pthread_kill(tid, libc::SIGUSR1);
+                }
             }
         }
     }
@@ -372,13 +432,23 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         }
     };
 
+    let start_time = std::time::Instant::now();
+    syslog_log(
+        libc::LOG_INFO,
+        &format!("[+0.0ms] pam_sm_authenticate started for user: {}", username),
+    );
+
     // Check if fingerprint scanner is available and has enrolled fingers
     let fp_available = match check_fingerprint_enrolled(&username) {
         Ok(available) => available,
         Err(e) => {
             syslog_log(
                 libc::LOG_DEBUG,
-                &format!("Fingerprint reader check failed: {}", e),
+                &format!(
+                    "[+{:?}] Fingerprint reader check failed: {}",
+                    start_time.elapsed(),
+                    e
+                ),
             );
             false
         }
@@ -387,7 +457,10 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     if !fp_available {
         syslog_log(
             libc::LOG_INFO,
-            "Fingerprint authentication not available; falling back to password.",
+            &format!(
+                "[+{:?}] Fingerprint authentication not available; falling back to password.",
+                start_time.elapsed()
+            ),
         );
         let prompt_res = prompt_password(pamh, "Password: ");
         return match prompt_res {
@@ -408,7 +481,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         Err(e) => {
             syslog_log(
                 libc::LOG_ERR,
-                &format!("Failed to connect to system bus: {}", e),
+                &format!(
+                    "[+{:?}] Failed to connect to system bus: {}",
+                    start_time.elapsed(),
+                    e
+                ),
             );
             return PAM_SYSTEM_ERR;
         }
@@ -419,7 +496,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         Err(e) => {
             syslog_log(
                 libc::LOG_ERR,
-                &format!("Failed to instantiate Fprint Manager proxy: {}", e),
+                &format!(
+                    "[+{:?}] Failed to instantiate Fprint Manager proxy: {}",
+                    start_time.elapsed(),
+                    e
+                ),
             );
             return PAM_SYSTEM_ERR;
         }
@@ -430,7 +511,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         Err(e) => {
             syslog_log(
                 libc::LOG_ERR,
-                &format!("Failed to get default fprint device: {}", e),
+                &format!(
+                    "[+{:?}] Failed to get default fprint device: {}",
+                    start_time.elapsed(),
+                    e
+                ),
             );
             return PAM_SYSTEM_ERR;
         }
@@ -445,7 +530,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         Err(e) => {
             syslog_log(
                 libc::LOG_ERR,
-                &format!("Failed to build Fprint Device proxy: {}", e),
+                &format!(
+                    "[+{:?}] Failed to build Fprint Device proxy: {}",
+                    start_time.elapsed(),
+                    e
+                ),
             );
             return PAM_SYSTEM_ERR;
         }
@@ -454,7 +543,11 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     if let Err(e) = device.claim(&username) {
         syslog_log(
             libc::LOG_ERR,
-            &format!("Failed to claim fprint device: {}", e),
+            &format!(
+                "[+{:?}] Failed to claim fprint device: {}",
+                start_time.elapsed(),
+                e
+            ),
         );
         return PAM_SYSTEM_ERR;
     }
@@ -463,16 +556,29 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
     let auth_success = AtomicBool::new(false);
     let pw_thread_id = Mutex::new(None);
+    let fp_thread_id = Mutex::new(None);
     let pamh_usize = pamh as usize;
 
     std::thread::scope(|s| {
         // Spawn fingerprint authentication thread
         s.spawn(|| {
-            if let Err(e) = run_fingerprint_auth(&device, &auth_success, &pw_thread_id) {
-                syslog_log(
-                    libc::LOG_ERR,
-                    &format!("Fingerprint thread error: {}", e),
-                );
+            if let Err(e) = run_fingerprint_auth(
+                &device,
+                &auth_success,
+                &pw_thread_id,
+                &fp_thread_id,
+                start_time,
+            ) {
+                if !auth_success.load(Ordering::SeqCst) {
+                    syslog_log(
+                        libc::LOG_ERR,
+                        &format!(
+                            "[+{:?}] Fingerprint thread error: {}",
+                            start_time.elapsed(),
+                            e
+                        ),
+                    );
+                }
             }
         });
 
@@ -483,24 +589,41 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &shadow_hash,
                 &auth_success,
                 &pw_thread_id,
+                &fp_thread_id,
                 Some(&device),
+                start_time,
             );
         });
     });
 
     restore_sigusr1_handler();
     let _ = device.release();
+    syslog_log(
+        libc::LOG_INFO,
+        &format!(
+            "[+{:?}] Thread scope joined, device released.",
+            start_time.elapsed()
+        ),
+    );
 
     if auth_success.load(Ordering::SeqCst) {
         syslog_log(
             libc::LOG_INFO,
-            &format!("Authentication successful for user {}.", username),
+            &format!(
+                "[+{:?}] Authentication successful for user {}.",
+                start_time.elapsed(),
+                username
+            ),
         );
         PAM_SUCCESS
     } else {
         syslog_log(
             libc::LOG_WARNING,
-            &format!("Authentication failed for user {}.", username),
+            &format!(
+                "[+{:?}] Authentication failed for user {}.",
+                start_time.elapsed(),
+                username
+            ),
         );
         PAM_AUTH_ERR
     }
