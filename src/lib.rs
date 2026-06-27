@@ -374,21 +374,43 @@ async fn run_fingerprint_auth(
                 // Print the RED warning message immediately to the user
                 if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
                     use std::io::Write;
-                    eprint!("\r\x1b[2K\x1b[31m[PAM] Fingerprint reader is busy (already claimed).\x1b[0m\nPassword: ");
+                    eprint!("\r\x1b[2K\x1b[31mFingerprint reader is busy.\x1b[0m\nPassword: ");
                     let _ = std::io::stderr().flush();
                 }
 
-                // Start retrying in the background every 10ms for up to 30 times (300ms total)
+                syslog_log(
+                    libc::LOG_INFO,
+                    &format!("[+{:?}] Fingerprint reader is busy, starting background claim retries...", start_time.elapsed()),
+                );
+
+                // Start retrying in the background every 100ms until we succeed or the password thread succeeds
                 let mut success = false;
-                for _attempt in 1..=30 {
+                let mut attempt = 0;
+                while !auth_success.load(Ordering::SeqCst) {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     if auth_success.load(Ordering::SeqCst) {
-                        return Ok(false);
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    if device.claim(username).await.is_ok() {
-                        claimed = true;
-                        success = true;
                         break;
+                    }
+                    attempt += 1;
+                    match device.claim(username).await {
+                        Ok(_) => {
+                            claimed = true;
+                            success = true;
+                            syslog_log(
+                                libc::LOG_INFO,
+                                &format!("[+{:?}] Fingerprint reader successfully claimed on attempt {}.", start_time.elapsed(), attempt),
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            // Log every 10 attempts (1 second) to avoid spamming syslog too much
+                            if attempt % 10 == 0 {
+                                syslog_log(
+                                    libc::LOG_DEBUG,
+                                    &format!("[+{:?}] Fingerprint reader claim retry {} still busy...", start_time.elapsed(), attempt),
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -396,11 +418,11 @@ async fn run_fingerprint_auth(
                     // Success! Print the GREEN reconnected message, converting the warning in-place
                     if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
                         use std::io::Write;
-                        eprint!("\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[32m[PAM] Fingerprint scanner reconnected.\x1b[0m\nPassword: ");
+                        eprint!("\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[32mFingerprint scanner was reconnected.\x1b[0m\nPassword: ");
                         let _ = std::io::stderr().flush();
                     }
                 } else {
-                    return Err(e.into());
+                    return Ok(false);
                 }
             } else {
                 return Err(e.into());
