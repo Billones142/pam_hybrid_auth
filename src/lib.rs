@@ -1,8 +1,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use zbus::blocking::Connection;
 use zbus::proxy;
+use zbus::Connection;
+use futures_util::stream::StreamExt;
 
 // --- PAM FFI Definitions ---
 
@@ -159,6 +160,66 @@ unsafe fn get_username(pamh: *const libc::c_void) -> Result<String, libc::c_int>
     Ok(username)
 }
 
+unsafe fn read_password_with_stars(prompt_text: &str) -> Result<String, libc::c_int> {
+    use std::io::{Write, stdout};
+    print!("{}", prompt_text);
+    let _ = stdout().flush();
+
+    let fd = libc::STDIN_FILENO;
+    if libc::isatty(fd) == 0 {
+        return Err(PAM_CONV_ERR);
+    }
+
+    let mut termios = std::mem::zeroed();
+    if libc::tcgetattr(fd, &mut termios) != 0 {
+        return Err(PAM_CONV_ERR);
+    }
+
+    let original_termios = termios;
+
+    // Disable canonical mode (ICANON) and echo (ECHO)
+    termios.c_lflag &= !(libc::ICANON | libc::ECHO);
+    if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
+        return Err(PAM_CONV_ERR);
+    }
+
+    let mut password = String::new();
+    let mut buf = [0u8; 1];
+
+    loop {
+        let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1);
+        if n <= 0 {
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &original_termios);
+            return Err(PAM_CONV_ERR);
+        }
+
+        let ch = buf[0];
+        if ch == b'\n' || ch == b'\r' {
+            println!();
+            break;
+        } else if ch == 8 || ch == 127 {
+            // Backspace
+            if !password.is_empty() {
+                password.pop();
+                print!("\x08 \x08");
+                let _ = stdout().flush();
+            }
+        } else if ch == 3 {
+            // Ctrl+C
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &original_termios);
+            println!();
+            return Err(PAM_CONV_ERR);
+        } else if ch.is_ascii_graphic() || ch == b' ' {
+            password.push(ch as char);
+            print!("*");
+            let _ = stdout().flush();
+        }
+    }
+
+    let _ = libc::tcsetattr(fd, libc::TCSANOW, &original_termios);
+    Ok(password)
+}
+
 unsafe fn prompt_password(
     pamh: *const libc::c_void,
     prompt_text: &str,
@@ -250,17 +311,12 @@ fn get_shadow_hash(username: &str) -> Result<String, String> {
 
 // --- Verification Logic ---
 
-fn run_fingerprint_auth(
+async fn run_fingerprint_auth(
     username: &str,
     auth_success: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
-    fp_thread_id: &Mutex<Option<libc::pthread_t>>,
-    conn_shared: &Mutex<Option<Connection>>,
     start_time: std::time::Instant,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let self_id = unsafe { libc::pthread_self() };
-    *fp_thread_id.lock().unwrap() = Some(self_id);
-
     syslog_log(
         libc::LOG_DEBUG,
         &format!("[+{:?}] Fingerprint thread: starting DBus connection...", start_time.elapsed()),
@@ -270,31 +326,31 @@ fn run_fingerprint_auth(
         return Ok(false);
     }
 
-    let conn = Connection::system()?;
-    *conn_shared.lock().unwrap() = Some(conn.clone());
+    let conn = Connection::system().await?;
 
     if auth_success.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
-    let manager = FprintManagerProxyBlocking::new(&conn)?;
+    let manager = FprintManagerProxy::new(&conn).await?;
 
     if auth_success.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
-    let device_path = manager.get_default_device()?;
+    let device_path = manager.get_default_device().await?;
 
     if auth_success.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
-    let device = FprintDeviceProxyBlocking::builder(&conn)
+    let device = FprintDeviceProxy::builder(&conn)
         .path(device_path)?
-        .build()?;
+        .build()
+        .await?;
 
     // Check if enrolled
-    let enrolled = device.list_enrolled_fingers(username)?;
+    let enrolled = device.list_enrolled_fingers(username).await?;
     if enrolled.is_empty() {
         syslog_log(
             libc::LOG_INFO,
@@ -303,97 +359,126 @@ fn run_fingerprint_auth(
         return Ok(false);
     }
 
-    // Set up cleanup guard
-    struct DeviceReleaser<'a> {
-        device: &'a FprintDeviceProxyBlocking<'a>,
-        claimed: bool,
-        started: bool,
-    }
-    impl<'a> Drop for DeviceReleaser<'a> {
-        fn drop(&mut self) {
-            if self.started {
-                let _ = self.device.verify_stop();
-            }
-            if self.claimed {
-                let _ = self.device.release();
-            }
-        }
-    }
-
-    let mut guard = DeviceReleaser {
-        device: &device,
-        claimed: false,
-        started: false,
-    };
-
     if auth_success.load(Ordering::SeqCst) {
         return Ok(false);
     }
 
-    device.claim(username)?;
-    guard.claimed = true;
-
-    if auth_success.load(Ordering::SeqCst) {
-        return Ok(false);
-    }
-
-    syslog_log(
-        libc::LOG_DEBUG,
-        &format!("[+{:?}] Fingerprint thread: starting VerifyStart...", start_time.elapsed()),
-    );
-    device.verify_start("any")?;
-    guard.started = true;
-    syslog_log(
-        libc::LOG_DEBUG,
-        &format!("[+{:?}] Fingerprint thread: VerifyStart completed. Waiting for signals...", start_time.elapsed()),
-    );
-
-    let iter = device.receive_verify_status()?;
-    for signal in iter {
+    let mut claimed = false;
+    for attempt in 1..=6 {
         if auth_success.load(Ordering::SeqCst) {
-            break;
+            return Ok(false);
+        }
+        match device.claim(username).await {
+            Ok(_) => {
+                claimed = true;
+                break;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("AlreadyInUse") && attempt < 6 {
+                    syslog_log(
+                        libc::LOG_DEBUG,
+                        &format!(
+                            "[+{:?}] Device already claimed, retrying in 50ms (attempt {}/5)...",
+                            start_time.elapsed(),
+                            attempt
+                        ),
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    let mut started = false;
+    let mut result_ok = false;
+
+    let res = async {
+        if auth_success.load(Ordering::SeqCst) {
+            return Ok(false);
         }
 
-        let args = signal.args()?;
-        let result_str: &str = &args.result;
         syslog_log(
             libc::LOG_DEBUG,
-            &format!(
-                "[+{:?}] Fingerprint signal received: {}, done: {}",
-                start_time.elapsed(),
-                result_str,
-                args.done
-            ),
+            &format!("[+{:?}] Fingerprint thread: starting VerifyStart...", start_time.elapsed()),
+        );
+        device.verify_start("any").await?;
+        started = true;
+        syslog_log(
+            libc::LOG_DEBUG,
+            &format!("[+{:?}] Fingerprint thread: VerifyStart completed. Waiting for signals...", start_time.elapsed()),
         );
 
-        match result_str {
-            "verify-match" => {
-                auth_success.store(true, Ordering::SeqCst);
-                // Busy wait briefly if the password thread ID is not written yet
-                let tid = loop {
-                    if let Some(id) = *pw_thread_id.lock().unwrap() {
-                        break id;
+        let mut stream = device.receive_verify_status().await?;
+        loop {
+            if auth_success.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Check for signals with a 100ms timeout
+            match tokio::time::timeout(tokio::time::Duration::from_millis(100), stream.next()).await {
+                Ok(Some(signal)) => {
+                    let args = signal.args()?;
+                    let result_str: &str = &args.result;
+                    syslog_log(
+                        libc::LOG_DEBUG,
+                        &format!(
+                            "[+{:?}] Fingerprint signal received: {}, done: {}",
+                            start_time.elapsed(),
+                            result_str,
+                            args.done
+                        ),
+                    );
+
+                    match result_str {
+                        "verify-match" => {
+                            auth_success.store(true, Ordering::SeqCst);
+                            let tid = loop {
+                                if let Some(id) = *pw_thread_id.lock().unwrap() {
+                                    break id;
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                            };
+                            unsafe {
+                                libc::pthread_kill(tid, libc::SIGUSR1);
+                            }
+                            result_ok = true;
+                            break;
+                        }
+                        "verify-no-match" => {
+                            if args.done {
+                                break;
+                            }
+                        }
+                        _ => {
+                            if args.done {
+                                break;
+                            }
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                };
-                unsafe {
-                    libc::pthread_kill(tid, libc::SIGUSR1);
                 }
-                return Ok(true);
-            }
-            "verify-no-match" => {
-                if args.done {
+                Ok(None) => {
                     break;
                 }
-            }
-            _ => {
-                if args.done {
-                    break;
+                Err(_) => {
+                    // Timeout (100ms elapsed without signal), loop again and check auth_success
                 }
             }
         }
+        Ok::<bool, Box<dyn std::error::Error>>(result_ok)
+    }.await;
+
+    // Clean up
+    if started {
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(50), device.verify_stop()).await;
     }
-    Ok(false)
+    if claimed {
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(50), device.release()).await;
+    }
+
+    res
 }
 
 fn run_password_auth(
@@ -401,8 +486,7 @@ fn run_password_auth(
     shadow_hash: &str,
     auth_success: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
-    fp_thread_id: &Mutex<Option<libc::pthread_t>>,
-    conn_shared: &Mutex<Option<Connection>>,
+    show_stars: bool,
     start_time: std::time::Instant,
 ) {
     let self_id = unsafe { libc::pthread_self() };
@@ -412,7 +496,13 @@ fn run_password_auth(
         libc::LOG_DEBUG,
         &format!("[+{:?}] Password thread: prompt starting...", start_time.elapsed()),
     );
-    let prompt_res = unsafe { prompt_password(pamh, "Password: ") };
+    let prompt_res = unsafe {
+        if show_stars && libc::isatty(libc::STDIN_FILENO) != 0 {
+            read_password_with_stars("Password: ")
+        } else {
+            prompt_password(pamh, "Password: ")
+        }
+    };
     syslog_log(
         libc::LOG_DEBUG,
         &format!("[+{:?}] Password thread: prompt returned.", start_time.elapsed()),
@@ -436,17 +526,6 @@ fn run_password_auth(
                     &format!("[+{:?}] Password thread: verification failed.", start_time.elapsed()),
                 );
             }
-            // Close the D-Bus connection to force unblock the fingerprint thread
-            if let Some(conn) = conn_shared.lock().unwrap().take() {
-                let _ = conn.close();
-            }
-            // Signal fingerprint thread to wake up and exit
-            let tid_opt = *fp_thread_id.lock().unwrap();
-            if let Some(tid) = tid_opt {
-                unsafe {
-                    libc::pthread_kill(tid, libc::SIGUSR1);
-                }
-            }
         }
         Err(err) => {
             syslog_log(
@@ -457,17 +536,6 @@ fn run_password_auth(
                     err
                 ),
             );
-            // Close the D-Bus connection to force unblock the fingerprint thread
-            if let Some(conn) = conn_shared.lock().unwrap().take() {
-                let _ = conn.close();
-            }
-            // Signal fingerprint thread to wake up and exit
-            let tid_opt = *fp_thread_id.lock().unwrap();
-            if let Some(tid) = tid_opt {
-                unsafe {
-                    libc::pthread_kill(tid, libc::SIGUSR1);
-                }
-            }
         }
     }
 }
@@ -506,23 +574,50 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
     setup_sigusr1_handler();
 
+    let mut show_stars = false;
+    for i in 0.._argc as usize {
+        let arg_str = CStr::from_ptr(*_argv.add(i)).to_string_lossy();
+        if arg_str == "show_stars" {
+            show_stars = true;
+        }
+    }
+
     let auth_success = AtomicBool::new(false);
     let pw_thread_id = Mutex::new(None);
-    let fp_thread_id = Mutex::new(None);
-    let conn_shared = Mutex::new(None);
     let pamh_usize = pamh as usize;
 
     std::thread::scope(|s| {
         // Spawn fingerprint authentication thread
         s.spawn(|| {
-            if let Err(e) = run_fingerprint_auth(
-                &username,
-                &auth_success,
-                &pw_thread_id,
-                &fp_thread_id,
-                &conn_shared,
-                start_time,
-            ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let res = rt.block_on(async {
+                run_fingerprint_auth(
+                    &username,
+                    &auth_success,
+                    &pw_thread_id,
+                    start_time,
+                ).await
+            });
+
+            if let Err(e) = res {
+                let err_str = e.to_string();
+                let user_msg = if err_str.contains("AlreadyInUse") {
+                    "Fingerprint reader is busy (already claimed)."
+                } else if err_str.contains("PermissionDenied") {
+                    "Permission denied accessing fingerprint reader."
+                } else {
+                    "Fingerprint reader initialization failed."
+                };
+
+                if libc::isatty(libc::STDERR_FILENO) != 0 {
+                    use std::io::Write;
+                    eprint!("\r\x1b[2K[PAM] {}\nPassword: ", user_msg);
+                    let _ = std::io::stderr().flush();
+                }
+
                 if !auth_success.load(Ordering::SeqCst) {
                     syslog_log(
                         libc::LOG_ERR,
@@ -543,8 +638,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &shadow_hash,
                 &auth_success,
                 &pw_thread_id,
-                &fp_thread_id,
-                &conn_shared,
+                show_stars,
                 start_time,
             );
         });

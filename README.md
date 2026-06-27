@@ -76,6 +76,15 @@ For example, to require it for `sudo`, edit `/etc/pam.d/sudo` and add the follow
 auth sufficient pam_password_fingerprint.so
 ```
 
+### Configuration Options
+
+* `show_stars`: Enables visual asterisk feedback (`*`) in the terminal when typing the password. By default, typing feedback is hidden (blank).
+
+Example configuration:
+```pam
+auth sufficient pam_password_fingerprint.so show_stars
+```
+
 ---
 
 ## Testing

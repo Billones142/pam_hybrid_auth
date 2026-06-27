@@ -34,10 +34,17 @@ fi
 echo "To test the PAM module, we need to create a test configuration at $PAM_CONF_PATH."
 echo "This requires sudo privileges. Creating config..."
 
+# Check for argument to show stars
+SHOW_STARS_ARG=""
+if [ "$1" == "show_stars" ]; then
+    SHOW_STARS_ARG="show_stars"
+    echo "Enabling password typing feedback with asterisks."
+fi
+
 # Setup temporary PAM config
 sudo bash -c "cat > $PAM_CONF_PATH" <<EOF
 # PAM configuration for testing pam_password_fingerprint
-auth required $PAM_MODULE_PATH
+auth required $PAM_MODULE_PATH $SHOW_STARS_ARG
 account required pam_permit.so
 EOF
 

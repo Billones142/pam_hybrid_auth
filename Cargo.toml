@@ -8,4 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 libc = "0.2"
-zbus = { version = "4", features = ["blocking"] }
+zbus = { version = "4" }
+tokio = { version = "1", features = ["rt", "time"] }
+futures-util = "0.3"
