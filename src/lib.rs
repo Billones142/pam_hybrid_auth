@@ -269,15 +269,12 @@ fn run_fingerprint_auth(
     device.verify_start("any")?;
 
     let iter = device.receive_verify_status()?;
-    for msg_res in iter {
+    for signal in iter {
         if auth_success.load(Ordering::SeqCst) {
             break;
         }
 
-        let msg = msg_res?;
-        let args: VerifyStatusArgs = msg.args()?;
-
-        match args.result.as_str() {
+        match signal.result.as_str() {
             "verify-match" => {
                 auth_success.store(true, Ordering::SeqCst);
                 // Busy wait briefly if the password thread ID is not written yet
@@ -293,12 +290,12 @@ fn run_fingerprint_auth(
                 return Ok(true);
             }
             "verify-no-match" => {
-                if args.done {
+                if signal.done {
                     break;
                 }
             }
             _ => {
-                if args.done {
+                if signal.done {
                     break;
                 }
             }
@@ -463,6 +460,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
     let auth_success = AtomicBool::new(false);
     let pw_thread_id = Mutex::new(None);
+    let pamh_usize = pamh as usize;
 
     std::thread::scope(|s| {
         // Spawn fingerprint authentication thread
@@ -478,7 +476,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         // Spawn password authentication thread
         s.spawn(|| {
             run_password_auth(
-                pamh,
+                pamh_usize as *const libc::c_void,
                 &shadow_hash,
                 &auth_success,
                 &pw_thread_id,
