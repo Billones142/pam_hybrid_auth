@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use zbus::proxy;
 use zbus::Connection;
@@ -10,6 +10,7 @@ use futures_util::stream::StreamExt;
 pub const PAM_SUCCESS: libc::c_int = 0;
 pub const PAM_AUTH_ERR: libc::c_int = 7;
 pub const PAM_USER_UNKNOWN: libc::c_int = 10;
+pub const PAM_MAXTRIES: libc::c_int = 11;
 pub const PAM_CONV_ERR: libc::c_int = 19;
 pub const PAM_BUF_ERR: libc::c_int = 5;
 pub const PAM_SYSTEM_ERR: libc::c_int = 4;
@@ -171,15 +172,15 @@ unsafe fn read_password_from_tty(prompt_text: &str, show_stars: bool) -> Result<
         return Err(PAM_CONV_ERR);
     }
 
-    let mut termios = std::mem::zeroed();
+    let mut termios = unsafe { std::mem::zeroed() };
     if libc::tcgetattr(fd, &mut termios) != 0 {
         return Err(PAM_CONV_ERR);
     }
 
     let original_termios = termios;
 
-    // Disable canonical mode (ICANON) and echo (ECHO)
-    termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+    // Disable canonical mode (ICANON), echo (ECHO), and signal generation (ISIG)
+    termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
     if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
         return Err(PAM_CONV_ERR);
     }
@@ -419,6 +420,8 @@ async fn run_fingerprint_auth(
     username: &str,
     auth_success: &AtomicBool,
     auth_finished: &AtomicBool,
+    _auth_canceled: &AtomicBool,
+    auth_method: &AtomicU32,
     pw_failed: &AtomicBool,
     _fp_failed: &AtomicBool,
     shared_state: &Mutex<SharedState>,
@@ -599,6 +602,7 @@ async fn run_fingerprint_auth(
 
                         match result_str {
                             "verify-match" => {
+                                auth_method.store(2, Ordering::SeqCst);
                                 auth_success.store(true, Ordering::SeqCst);
                                 auth_finished.store(true, Ordering::SeqCst);
                                 let tid = loop {
@@ -671,6 +675,8 @@ fn run_password_auth(
     shadow_hash: &str,
     auth_success: &AtomicBool,
     auth_finished: &AtomicBool,
+    auth_canceled: &AtomicBool,
+    auth_method: &AtomicU32,
     pw_failed: &AtomicBool,
     fp_failed: &AtomicBool,
     shared_state: &Mutex<SharedState>,
@@ -723,6 +729,7 @@ fn run_password_auth(
                     &format!("[+{:?}] Password thread: crypt verification starting...", start_time.elapsed()),
                 );
                 if verify_password_hash(&password, shadow_hash) {
+                    auth_method.store(1, Ordering::SeqCst);
                     auth_success.store(true, Ordering::SeqCst);
                     auth_finished.store(true, Ordering::SeqCst);
                     syslog_log(
@@ -762,46 +769,57 @@ fn run_password_auth(
                         err
                     ),
                 );
+                // Trigger immediate auth exit
+                auth_canceled.store(true, Ordering::SeqCst);
+                auth_finished.store(true, Ordering::SeqCst);
                 break;
             }
         }
     }
 
-    pw_failed.store(true, Ordering::SeqCst);
+    if !auth_success.load(Ordering::SeqCst) {
+        pw_failed.store(true, Ordering::SeqCst);
 
-    // If password attempts are exhausted, but fingerprint scanner is still running:
-    if !fp_failed.load(Ordering::SeqCst) {
-        if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
-            use std::io::Write;
-            eprint!("\r\x1b[2KWaiting for fingerprint...");
-            let _ = std::io::stderr().flush();
-        }
+        // If password attempts are exhausted, but fingerprint scanner is still running:
+        if !fp_failed.load(Ordering::SeqCst) {
+            if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+                use std::io::Write;
+                eprint!("\r\x1b[2KWaiting for fingerprint...");
+                let _ = std::io::stderr().flush();
+            }
 
-        // Disable input echo and swallow all characters
-        let fd = libc::STDIN_FILENO;
-        if unsafe { libc::isatty(fd) } != 0 {
-            let mut termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
-                let original_termios = termios;
-                termios.c_lflag &= !(libc::ECHO | libc::ICANON);
-                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+            // Disable input echo, canonical mode, and signal generation
+            let fd = libc::STDIN_FILENO;
+            if unsafe { libc::isatty(fd) } != 0 {
+                let mut termios = unsafe { std::mem::zeroed() };
+                if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
+                    let original_termios = termios;
+                    termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+                    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
 
-                let mut buf = [0u8; 1];
-                while !auth_finished.load(Ordering::SeqCst) {
-                    // We read character-by-character. If SIGUSR1 is sent, this returns -1 (EINTR).
-                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-                    if n <= 0 {
-                        break;
+                    let mut buf = [0u8; 1];
+                    while !auth_finished.load(Ordering::SeqCst) {
+                        // We read character-by-character. If SIGUSR1 is sent, this returns -1 (EINTR).
+                        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                        if n <= 0 {
+                            break;
+                        }
+                        if buf[0] == 3 {
+                            // Ctrl+C was pressed! Abort everything!
+                            auth_canceled.store(true, Ordering::SeqCst);
+                            auth_finished.store(true, Ordering::SeqCst);
+                            break;
+                        }
                     }
-                }
 
-                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
+                    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
+                }
             }
         }
-    }
 
-    if fp_failed.load(Ordering::SeqCst) {
-        auth_finished.store(true, Ordering::SeqCst);
+        if fp_failed.load(Ordering::SeqCst) {
+            auth_finished.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -848,6 +866,8 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
     let auth_success = AtomicBool::new(false);
     let auth_finished = AtomicBool::new(false);
+    let auth_canceled = AtomicBool::new(false);
+    let auth_method = AtomicU32::new(0); // 1 = password, 2 = fingerprint
     let pw_failed = AtomicBool::new(false);
     let fp_failed = AtomicBool::new(false);
     let shared_state = Mutex::new(SharedState {
@@ -871,6 +891,8 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                     &username,
                     &auth_success,
                     &auth_finished,
+                    &auth_canceled,
+                    &auth_method,
                     &pw_failed,
                     &fp_failed,
                     &shared_state,
@@ -933,6 +955,8 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &shadow_hash,
                 &auth_success,
                 &auth_finished,
+                &auth_canceled,
+                &auth_method,
                 &pw_failed,
                 &fp_failed,
                 &shared_state,
@@ -954,25 +978,46 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     );
 
     if auth_success.load(Ordering::SeqCst) {
+        let method_str = match auth_method.load(Ordering::SeqCst) {
+            1 => "password",
+            2 => "fingerprint",
+            _ => "unknown",
+        };
+        if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+            use std::io::Write;
+            eprint!("\r\x1b[2K\x1b[32mAuthentication successful with {}.\x1b[0m\n", method_str);
+            let _ = std::io::stderr().flush();
+        }
         syslog_log(
             libc::LOG_INFO,
             &format!(
-                "[+{:?}] Authentication successful for user {}.",
+                "[+{:?}] Authentication successful via {} for user {}.",
                 start_time.elapsed(),
+                method_str,
                 username
             ),
         );
         PAM_SUCCESS
-    } else {
+    } else if auth_canceled.load(Ordering::SeqCst) {
         syslog_log(
             libc::LOG_WARNING,
             &format!(
-                "[+{:?}] Authentication failed for user {}.",
+                "[+{:?}] Authentication canceled by user (Ctrl+C) for user {}.",
                 start_time.elapsed(),
                 username
             ),
         );
-        PAM_AUTH_ERR
+        PAM_MAXTRIES
+    } else {
+        syslog_log(
+            libc::LOG_WARNING,
+            &format!(
+                "[+{:?}] Authentication failed/exhausted for user {}.",
+                start_time.elapsed(),
+                username
+            ),
+        );
+        PAM_MAXTRIES
     }
 }
 
