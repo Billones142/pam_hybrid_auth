@@ -4,6 +4,13 @@ A professional, high-performance Pluggable Authentication Module (PAM) written i
 
 Unlike standard PAM stacks that process authentication sequentially (causing frustrating timeouts or delays while waiting for the fingerprint scanner before prompting for a password), this module runs both authentication checks in parallel.
 
+### A Modern Alternative to `pam-fprint-grosshack`
+
+This module serves as a modern, memory-safe, and robust Rust alternative to the legacy `pam-fprint-grosshack`. While `pam-fprint-grosshack` relied on complex C process forking, pipe redirection, and terminal hacking, this module uses structured Rust concurrency (`std::thread::scope`) and direct D-Bus communication with `fprintd` to achieve concurrent authentication safely and cleanly. It also offers advanced features such as:
+* Dynamic, single-line in-place error warnings.
+* Customizable attempt counters per method.
+* Optional typing asterisk feedback (`show_stars`).
+
 ### Key Features
 * **No Delay Fallback:** If you type your password first, it authenticates immediately without waiting for the fingerprint reader to time out.
 * **Instant Fingerprint Login:** If you swipe your finger first, it completes the authentication instantly and cancels the pending password prompt.
