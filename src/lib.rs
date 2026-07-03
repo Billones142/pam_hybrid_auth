@@ -196,7 +196,7 @@ unsafe fn read_password_with_stars(prompt_text: &str) -> Result<String, libc::c_
         let ch = buf[0];
         if ch == b'\n' || ch == b'\r' {
             let _ = libc::tcsetattr(fd, libc::TCSANOW, &original_termios);
-            eprint!("\rPassword: \x1b[K\n");
+            eprint!("\rPassword: \x1b[K");
             let _ = std::io::stderr().flush();
             break;
         } else if ch == 8 || ch == 127 {
@@ -312,12 +312,63 @@ fn get_shadow_hash(username: &str) -> Result<String, String> {
     }
 }
 
+struct SharedState {
+    password_status: Option<String>,
+    fingerprint_status: Option<String>,
+    has_warning_line: bool,
+}
+
+fn update_status_line(
+    shared_state: &Mutex<SharedState>,
+    is_password_thread: bool,
+    new_status: Option<String>,
+    pw_failed: &AtomicBool,
+) {
+    if unsafe { libc::isatty(libc::STDERR_FILENO) } == 0 {
+        return;
+    }
+
+    let mut state = shared_state.lock().unwrap();
+    if is_password_thread {
+        state.password_status = new_status;
+    } else {
+        state.fingerprint_status = new_status;
+    }
+
+    let combined = match (&state.password_status, &state.fingerprint_status) {
+        (Some(p), Some(f)) => Some(format!("{} - {}", p, f)),
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(f)) => Some(f.clone()),
+        (None, None) => None,
+    };
+
+    let prompt = if pw_failed.load(Ordering::SeqCst) {
+        "Waiting for fingerprint..."
+    } else {
+        "Password: "
+    };
+
+    if let Some(msg) = combined {
+        use std::io::Write;
+        if state.has_warning_line {
+            eprint!("\r\x1b[2K\x1b[1A\r\x1b[2K{}\n{}", msg, prompt);
+        } else {
+            eprint!("\r\x1b[2K{}\n{}", msg, prompt);
+            state.has_warning_line = true;
+        }
+        let _ = std::io::stderr().flush();
+    }
+}
+
 // --- Verification Logic ---
 
 async fn run_fingerprint_auth(
     username: &str,
     auth_success: &AtomicBool,
     auth_finished: &AtomicBool,
+    pw_failed: &AtomicBool,
+    _fp_failed: &AtomicBool,
+    shared_state: &Mutex<SharedState>,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
     max_tries: u32,
     start_time: std::time::Instant,
@@ -378,9 +429,8 @@ async fn run_fingerprint_auth(
             if err_str.contains("AlreadyInUse") {
                 // Print the RED warning message immediately to the user
                 if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
-                    use std::io::Write;
-                    eprint!("\r\x1b[2K\x1b[31mFingerprint reader is busy.\x1b[0m\nPassword: ");
-                    let _ = std::io::stderr().flush();
+                    let msg = "\x1b[31mFingerprint reader is busy.\x1b[0m".to_string();
+                    update_status_line(shared_state, false, Some(msg), pw_failed);
                 }
 
                 syslog_log(
@@ -422,9 +472,8 @@ async fn run_fingerprint_auth(
                 if success {
                     // Success! Print the GREEN reconnected message, converting the warning in-place
                     if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
-                        use std::io::Write;
-                        eprint!("\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[32mFingerprint scanner was reconnected.\x1b[0m\nPassword: ");
-                        let _ = std::io::stderr().flush();
+                        let msg = "\x1b[32mFingerprint scanner was reconnected.\x1b[0m".to_string();
+                        update_status_line(shared_state, false, Some(msg), pw_failed);
                     }
                 } else {
                     return Ok(false);
@@ -513,13 +562,10 @@ async fn run_fingerprint_auth(
                             "verify-no-match" => {
                                 attempt_count += 1;
                                 if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
-                                    use std::io::Write;
-                                    if attempt_count == 1 {
-                                        eprint!("\r\x1b[2K\x1b[31mFingerprint did not match (attempt 1/{}).\x1b[0m\nPassword: ", max_tries);
-                                    } else {
-                                        eprint!("\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[31mFingerprint did not match (attempt {}/{}).\x1b[0m\nPassword: ", attempt_count, max_tries);
+                                    if max_tries > 1 {
+                                        let msg = format!("\x1b[31mFingerprint did not match (attempt {}/{})\x1b[0m", attempt_count, max_tries);
+                                        update_status_line(shared_state, false, Some(msg), pw_failed);
                                     }
-                                    let _ = std::io::stderr().flush();
                                 }
                                 got_no_match = true;
                                 break;
@@ -568,6 +614,9 @@ fn run_password_auth(
     shadow_hash: &str,
     auth_success: &AtomicBool,
     auth_finished: &AtomicBool,
+    pw_failed: &AtomicBool,
+    fp_failed: &AtomicBool,
+    shared_state: &Mutex<SharedState>,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
     show_stars: bool,
     max_tries: u32,
@@ -633,11 +682,14 @@ fn run_password_auth(
                             max_tries
                         ),
                     );
-                    if attempt < max_tries {
-                        // Print password failure message to user
-                        if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+                    // Print password failure message to user
+                    if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+                        if max_tries > 1 {
+                            let msg = format!("\x1b[31mPassword incorrect (attempt {}/{})\x1b[0m", attempt, max_tries);
+                            update_status_line(shared_state, true, Some(msg), pw_failed);
+                        } else {
                             use std::io::Write;
-                            eprint!("\r\x1b[2K\x1b[31mPassword incorrect.\x1b[0m\n");
+                            eprint!("\rPassword: \x1b[K");
                             let _ = std::io::stderr().flush();
                         }
                     }
@@ -657,7 +709,42 @@ fn run_password_auth(
         }
     }
 
-    auth_finished.store(true, Ordering::SeqCst);
+    pw_failed.store(true, Ordering::SeqCst);
+
+    // If password attempts are exhausted, but fingerprint scanner is still running:
+    if !fp_failed.load(Ordering::SeqCst) {
+        if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+            use std::io::Write;
+            eprint!("\r\x1b[2KWaiting for fingerprint...");
+            let _ = std::io::stderr().flush();
+        }
+
+        // Disable input echo and swallow all characters
+        let fd = libc::STDIN_FILENO;
+        if unsafe { libc::isatty(fd) } != 0 {
+            let mut termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
+                let original_termios = termios;
+                termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+
+                let mut buf = [0u8; 1];
+                while !auth_finished.load(Ordering::SeqCst) {
+                    // We read character-by-character. If SIGUSR1 is sent, this returns -1 (EINTR).
+                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                    if n <= 0 {
+                        break;
+                    }
+                }
+
+                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
+            }
+        }
+    }
+
+    if fp_failed.load(Ordering::SeqCst) {
+        auth_finished.store(true, Ordering::SeqCst);
+    }
 }
 
 #[no_mangle]
@@ -709,6 +796,13 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
     let auth_success = AtomicBool::new(false);
     let auth_finished = AtomicBool::new(false);
+    let pw_failed = AtomicBool::new(false);
+    let fp_failed = AtomicBool::new(false);
+    let shared_state = Mutex::new(SharedState {
+        password_status: None,
+        fingerprint_status: None,
+        has_warning_line: false,
+    });
     let pw_thread_id = Mutex::new(None);
     let pamh_usize = pamh as usize;
 
@@ -724,11 +818,30 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                     &username,
                     &auth_success,
                     &auth_finished,
+                    &pw_failed,
+                    &fp_failed,
+                    &shared_state,
                     &pw_thread_id,
                     max_tries,
                     start_time,
                 ).await
             });
+
+            // Fingerprint thread is done (either failed, errored, or no enrolled fingers)
+            fp_failed.store(true, Ordering::SeqCst);
+            if pw_failed.load(Ordering::SeqCst) {
+                auth_finished.store(true, Ordering::SeqCst);
+            }
+            // Send SIGUSR1 to wake up password thread if it is blocked in prompt/swallower,
+            // but only if fingerprint authentication succeeded or both failed.
+            if auth_success.load(Ordering::SeqCst) || auth_finished.load(Ordering::SeqCst) {
+                let tid = pw_thread_id.lock().unwrap().take();
+                if let Some(id) = tid {
+                    unsafe {
+                        libc::pthread_kill(id, libc::SIGUSR1);
+                    }
+                }
+            }
 
             if let Err(e) = res {
                 let err_str = e.to_string();
@@ -766,6 +879,9 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &shadow_hash,
                 &auth_success,
                 &auth_finished,
+                &pw_failed,
+                &fp_failed,
+                &shared_state,
                 &pw_thread_id,
                 show_stars,
                 max_tries,
