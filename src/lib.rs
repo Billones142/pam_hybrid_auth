@@ -15,6 +15,7 @@ pub const PAM_BUF_ERR: libc::c_int = 5;
 pub const PAM_SYSTEM_ERR: libc::c_int = 4;
 
 pub const PAM_USER: libc::c_int = 2;
+pub const PAM_SERVICE: libc::c_int = 3;
 pub const PAM_CONV: libc::c_int = 5;
 
 pub const PAM_PROMPT_ECHO_OFF: libc::c_int = 1;
@@ -160,7 +161,7 @@ unsafe fn get_username(pamh: *const libc::c_void) -> Result<String, libc::c_int>
     Ok(username)
 }
 
-unsafe fn read_password_with_stars(prompt_text: &str) -> Result<String, libc::c_int> {
+unsafe fn read_password_from_tty(prompt_text: &str, show_stars: bool) -> Result<String, libc::c_int> {
     use std::io::{Write, stdout};
     print!("{}", prompt_text);
     let _ = stdout().flush();
@@ -178,7 +179,7 @@ unsafe fn read_password_with_stars(prompt_text: &str) -> Result<String, libc::c_
     let original_termios = termios;
 
     // Disable canonical mode (ICANON) and echo (ECHO)
-    termios.c_lflag &= !(libc::ICANON | libc::ECHO);
+    termios.c_lflag &= !(libc::ECHO | libc::ICANON);
     if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
         return Err(PAM_CONV_ERR);
     }
@@ -196,26 +197,30 @@ unsafe fn read_password_with_stars(prompt_text: &str) -> Result<String, libc::c_
         let ch = buf[0];
         if ch == b'\n' || ch == b'\r' {
             let _ = libc::tcsetattr(fd, libc::TCSANOW, &original_termios);
-            eprint!("\rPassword: \x1b[K");
+            eprint!("\r{}\x1b[K", prompt_text);
             let _ = std::io::stderr().flush();
             break;
         } else if ch == 8 || ch == 127 {
             // Backspace
             if !password.is_empty() {
                 password.pop();
-                print!("\x08 \x08");
-                let _ = stdout().flush();
+                if show_stars {
+                    print!("\x08 \x08");
+                    let _ = stdout().flush();
+                }
             }
         } else if ch == 3 {
             // Ctrl+C
             let _ = libc::tcsetattr(fd, libc::TCSANOW, &original_termios);
-            eprint!("\rPassword: \x1b[K\n");
+            eprint!("\r{}\x1b[K\n", prompt_text);
             let _ = std::io::stderr().flush();
             return Err(PAM_CONV_ERR);
         } else if ch.is_ascii_graphic() || ch == b' ' {
             password.push(ch as char);
-            print!("*");
-            let _ = stdout().flush();
+            if show_stars {
+                print!("*");
+                let _ = stdout().flush();
+            }
         }
     }
 
@@ -318,11 +323,63 @@ struct SharedState {
     has_warning_line: bool,
 }
 
+fn format_combined_status(p_status: &Option<String>, f_status: &Option<String>) -> Option<String> {
+    match (p_status, f_status) {
+        (Some(p), Some(f)) => Some(format!("{} - {}", p, f)),
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(f)) => Some(f.clone()),
+        (None, None) => None,
+    }
+}
+
+fn parse_args(args: &[String]) -> (bool, u32, u32) {
+    let mut show_stars = false;
+    let mut global_tries = 3;
+    let mut password_tries = None;
+    let mut fingerprint_tries = None;
+    for arg in args {
+        if arg == "show_stars" {
+            show_stars = true;
+        } else if arg.starts_with("tries=") {
+            if let Ok(t) = arg["tries=".len()..].parse::<u32>() {
+                global_tries = t;
+            }
+        } else if arg.starts_with("password_tries=") {
+            if let Ok(t) = arg["password_tries=".len()..].parse::<u32>() {
+                password_tries = Some(t);
+            }
+        } else if arg.starts_with("fingerprint_tries=") {
+            if let Ok(t) = arg["fingerprint_tries=".len()..].parse::<u32>() {
+                fingerprint_tries = Some(t);
+            }
+        }
+    }
+    let p_tries = password_tries.unwrap_or(global_tries);
+    let f_tries = fingerprint_tries.unwrap_or(global_tries);
+    (show_stars, p_tries, f_tries)
+}
+
+fn get_prompt_text(pamh: *const libc::c_void, username: &str) -> String {
+    let mut service_ptr: *const libc::c_void = std::ptr::null();
+    let service_name = if unsafe { pam_get_item(pamh, PAM_SERVICE, &mut service_ptr) } == PAM_SUCCESS && !service_ptr.is_null() {
+        unsafe { CStr::from_ptr(service_ptr as *const libc::c_char).to_string_lossy().into_owned() }
+    } else {
+        "login".to_string()
+    };
+
+    if service_name == "sudo" {
+        format!("[sudo] password for {}: ", username)
+    } else {
+        "Password: ".to_string()
+    }
+}
+
 fn update_status_line(
     shared_state: &Mutex<SharedState>,
     is_password_thread: bool,
     new_status: Option<String>,
     pw_failed: &AtomicBool,
+    prompt_text: &str,
 ) {
     if unsafe { libc::isatty(libc::STDERR_FILENO) } == 0 {
         return;
@@ -335,17 +392,12 @@ fn update_status_line(
         state.fingerprint_status = new_status;
     }
 
-    let combined = match (&state.password_status, &state.fingerprint_status) {
-        (Some(p), Some(f)) => Some(format!("{} - {}", p, f)),
-        (Some(p), None) => Some(p.clone()),
-        (None, Some(f)) => Some(f.clone()),
-        (None, None) => None,
-    };
+    let combined = format_combined_status(&state.password_status, &state.fingerprint_status);
 
     let prompt = if pw_failed.load(Ordering::SeqCst) {
         "Waiting for fingerprint..."
     } else {
-        "Password: "
+        prompt_text
     };
 
     if let Some(msg) = combined {
@@ -363,6 +415,7 @@ fn update_status_line(
 // --- Verification Logic ---
 
 async fn run_fingerprint_auth(
+    pamh: *const libc::c_void,
     username: &str,
     auth_success: &AtomicBool,
     auth_finished: &AtomicBool,
@@ -430,7 +483,8 @@ async fn run_fingerprint_auth(
                 // Print the RED warning message immediately to the user
                 if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
                     let msg = "\x1b[31mFingerprint reader is busy.\x1b[0m".to_string();
-                    update_status_line(shared_state, false, Some(msg), pw_failed);
+                    let prompt_text = get_prompt_text(pamh, username);
+                    update_status_line(shared_state, false, Some(msg), pw_failed, &prompt_text);
                 }
 
                 syslog_log(
@@ -473,7 +527,8 @@ async fn run_fingerprint_auth(
                     // Success! Print the GREEN reconnected message, converting the warning in-place
                     if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
                         let msg = "\x1b[32mFingerprint scanner was reconnected.\x1b[0m".to_string();
-                        update_status_line(shared_state, false, Some(msg), pw_failed);
+                        let prompt_text = get_prompt_text(pamh, username);
+                        update_status_line(shared_state, false, Some(msg), pw_failed, &prompt_text);
                     }
                 } else {
                     return Ok(false);
@@ -564,7 +619,8 @@ async fn run_fingerprint_auth(
                                 if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
                                     if max_tries > 1 {
                                         let msg = format!("\x1b[31mFingerprint did not match (attempt {}/{})\x1b[0m", attempt_count, max_tries);
-                                        update_status_line(shared_state, false, Some(msg), pw_failed);
+                                        let prompt_text = get_prompt_text(pamh, username);
+                                        update_status_line(shared_state, false, Some(msg), pw_failed, &prompt_text);
                                     }
                                 }
                                 got_no_match = true;
@@ -611,6 +667,7 @@ async fn run_fingerprint_auth(
 
 fn run_password_auth(
     pamh: *const libc::c_void,
+    username: &str,
     shadow_hash: &str,
     auth_success: &AtomicBool,
     auth_finished: &AtomicBool,
@@ -642,11 +699,12 @@ fn run_password_auth(
                 max_tries
             ),
         );
+        let prompt_text = get_prompt_text(pamh, username);
         let prompt_res = unsafe {
-            if show_stars && libc::isatty(libc::STDIN_FILENO) != 0 {
-                read_password_with_stars("Password: ")
+            if libc::isatty(libc::STDIN_FILENO) != 0 {
+                read_password_from_tty(&prompt_text, show_stars)
             } else {
-                prompt_password(pamh, "Password: ")
+                prompt_password(pamh, &prompt_text)
             }
         };
         syslog_log(
@@ -686,10 +744,10 @@ fn run_password_auth(
                     if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
                         if max_tries > 1 {
                             let msg = format!("\x1b[31mPassword incorrect (attempt {}/{})\x1b[0m", attempt, max_tries);
-                            update_status_line(shared_state, true, Some(msg), pw_failed);
+                            update_status_line(shared_state, true, Some(msg), pw_failed, &prompt_text);
                         } else {
                             use std::io::Write;
-                            eprint!("\rPassword: \x1b[K");
+                            eprint!("\r{}\x1b[K", prompt_text);
                             let _ = std::io::stderr().flush();
                         }
                     }
@@ -781,18 +839,12 @@ pub unsafe extern "C" fn pam_sm_authenticate(
 
     setup_sigusr1_handler();
 
-    let mut show_stars = false;
-    let mut max_tries = 3;
+    let mut args = Vec::new();
     for i in 0.._argc as usize {
-        let arg_str = CStr::from_ptr(*_argv.add(i)).to_string_lossy();
-        if arg_str == "show_stars" {
-            show_stars = true;
-        } else if arg_str.starts_with("tries=") {
-            if let Ok(t) = arg_str["tries=".len()..].parse::<u32>() {
-                max_tries = t;
-            }
-        }
+        let arg_str = CStr::from_ptr(*_argv.add(i)).to_string_lossy().into_owned();
+        args.push(arg_str);
     }
+    let (show_stars, pw_max_tries, fp_max_tries) = parse_args(&args);
 
     let auth_success = AtomicBool::new(false);
     let auth_finished = AtomicBool::new(false);
@@ -815,6 +867,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 .unwrap();
             let res = rt.block_on(async {
                 run_fingerprint_auth(
+                    pamh_usize as *const libc::c_void,
                     &username,
                     &auth_success,
                     &auth_finished,
@@ -822,7 +875,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                     &fp_failed,
                     &shared_state,
                     &pw_thread_id,
-                    max_tries,
+                    fp_max_tries,
                     start_time,
                 ).await
             });
@@ -876,6 +929,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         s.spawn(|| {
             run_password_auth(
                 pamh_usize as *const libc::c_void,
+                &username,
                 &shadow_hash,
                 &auth_success,
                 &auth_finished,
@@ -884,7 +938,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &shared_state,
                 &pw_thread_id,
                 show_stars,
-                max_tries,
+                pw_max_tries,
                 start_time,
             );
         });
@@ -930,4 +984,60 @@ pub unsafe extern "C" fn pam_sm_setcred(
     _argv: *const *const libc::c_char,
 ) -> libc::c_int {
     PAM_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_combined_status() {
+        assert_eq!(format_combined_status(&None, &None), None);
+        assert_eq!(
+            format_combined_status(&Some("A".to_string()), &None),
+            Some("A".to_string())
+        );
+        assert_eq!(
+            format_combined_status(&None, &Some("B".to_string())),
+            Some("B".to_string())
+        );
+        assert_eq!(
+            format_combined_status(&Some("A".to_string()), &Some("B".to_string())),
+            Some("A - B".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_args() {
+        let args = vec![
+            "show_stars".to_string(),
+            "tries=5".to_string(),
+            "password_tries=6".to_string(),
+            "fingerprint_tries=2".to_string(),
+        ];
+        let (show_stars, pw_tries, fp_tries) = parse_args(&args);
+        assert!(show_stars);
+        assert_eq!(pw_tries, 6);
+        assert_eq!(fp_tries, 2);
+
+        let args_global = vec!["tries=5".to_string()];
+        let (_, pw_g, fp_g) = parse_args(&args_global);
+        assert_eq!(pw_g, 5);
+        assert_eq!(fp_g, 5);
+
+        let args_default = vec![];
+        let (show_stars_d, pw_d, fp_d) = parse_args(&args_default);
+        assert!(!show_stars_d);
+        assert_eq!(pw_d, 3);
+        assert_eq!(fp_d, 3);
+
+        let args_invalid_tries = vec![
+            "tries=abc".to_string(),
+            "password_tries=def".to_string(),
+            "fingerprint_tries=ghi".to_string(),
+        ];
+        let (_, pw_inv, fp_inv) = parse_args(&args_invalid_tries);
+        assert_eq!(pw_inv, 3);
+        assert_eq!(fp_inv, 3);
+    }
 }

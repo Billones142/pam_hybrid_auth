@@ -29,3 +29,6 @@ install: build
 uninstall:
 	rm -f $(DESTDIR)$(PAM_DIR)/pam_password_fingerprint.so
 	@echo "PAM module removed from $(DESTDIR)$(PAM_DIR)/pam_password_fingerprint.so"
+
+test:
+	cargo test

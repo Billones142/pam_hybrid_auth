@@ -79,29 +79,47 @@ auth sufficient pam_password_fingerprint.so
 ### Configuration Options
 
 * `show_stars`: Enables visual asterisk feedback (`*`) in the terminal when typing the password. By default, typing feedback is hidden (blank).
+* `tries=X`: Configures the global default maximum number of attempts allowed for both password and fingerprint authentication (defaults to `3`).
+* `password_tries=Y`: Overrides and configures the maximum attempts allowed for password authentication.
+* `fingerprint_tries=Z`: Overrides and configures the maximum attempts allowed for fingerprint authentication.
 
-Example configuration:
+Example configuration (using different attempts limit for each method):
 ```pam
-auth sufficient pam_password_fingerprint.so show_stars
+auth sufficient pam_password_fingerprint.so show_stars password_tries=3 fingerprint_tries=5
 ```
+
+---
+
+## Advanced UX & Security Features
+
+* **Combined Error Warnings:** Both fingerprint and password attempts share a single warning line directly above the prompt (e.g. `Password incorrect (attempt 3/4). - Fingerprint did not match (attempt 2/4).`). Warnings update in-place dynamically.
+* **Smart Exit Logic:** The PAM module remains active as long as at least one authentication method has remaining attempts left.
+* **Keystroke Swallowing & Waiting Prompt:** When password attempts are fully exhausted, the prompt automatically changes to `Waiting for fingerprint...` and subsequent keyboard keystrokes are swallowed and disabled on the terminal to avoid raw key leaks.
+* **Busy Device Recovery:** If the fingerprint reader is busy/claimed, a red warning is shown immediately, and claims are retried every 100ms. Once claimed, the warning seamlessly converts to a green success message in-place.
 
 ---
 
 ## Testing
 
-A safety-first test script `test.sh` is provided in the repository root. It tests the module using `pamtester` without modifying your live login configurations, preventing you from locking yourself out of your system.
+We provide both automated unit tests and integration tests to verify the module's behavior.
 
-### How to Run the Tests:
-1. Ensure the module is compiled and installed (`make` and `sudo make install`).
-2. Run the test script:
-   ```bash
-   ./test.sh
-   ```
-3. The script will:
-   - Ask for sudo permissions (required to write a temporary test PAM service configuration in `/etc/pam.d/pam_test_password_fingerprint` and allow `/etc/shadow` reads).
-   - Run `pamtester` to authenticate your current user.
-   - Prompt you with `Password:`.
-   - **Test Case A (Password First):** Immediately type your password and hit Enter. The authentication should succeed instantly.
-   - **Test Case B (Fingerprint First):** Re-run the script. Swipe your finger on the fingerprint reader. The prompt should immediately terminate and report success.
-   - **Test Case C (Failure):** Type an incorrect password or scan an unregistered finger. The authentication should fail.
-   - Automatically clean up the test configuration file from `/etc/pam.d/` on completion.
+### 1. Rust Unit Tests
+Unit tests verify internal module logic such as argument parsing and status string formatting. To execute unit tests:
+```bash
+make test
+```
+(Runs `cargo test` under the hood).
+
+### 2. Automated Integration Tests
+An automated test script `automated_tests.sh` runs integration tests validating tries configuration limits and expected PAM prompting behavior. Run this with sudo:
+```bash
+sudo ./automated_tests.sh
+```
+
+### 3. Interactive Testing
+A safety-first interactive test script `test.sh` is provided in the repository root. It tests the module using `pamtester` without modifying your live login configurations, preventing you from locking yourself out of your system:
+```bash
+./test.sh [show_stars]
+```
+You can swipe a registered finger or type your password to verify the concurrent auth flow.
+
