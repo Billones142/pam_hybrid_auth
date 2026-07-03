@@ -570,59 +570,94 @@ fn run_password_auth(
     auth_finished: &AtomicBool,
     pw_thread_id: &Mutex<Option<libc::pthread_t>>,
     show_stars: bool,
+    max_tries: u32,
     start_time: std::time::Instant,
 ) {
     let self_id = unsafe { libc::pthread_self() };
     *pw_thread_id.lock().unwrap() = Some(self_id);
 
-    syslog_log(
-        libc::LOG_DEBUG,
-        &format!("[+{:?}] Password thread: prompt starting...", start_time.elapsed()),
-    );
-    let prompt_res = unsafe {
-        if show_stars && libc::isatty(libc::STDIN_FILENO) != 0 {
-            read_password_with_stars("Password: ")
-        } else {
-            prompt_password(pamh, "Password: ")
+    let mut attempt = 0;
+    while attempt < max_tries {
+        if auth_finished.load(Ordering::SeqCst) {
+            break;
         }
-    };
-    syslog_log(
-        libc::LOG_DEBUG,
-        &format!("[+{:?}] Password thread: prompt returned.", start_time.elapsed()),
-    );
 
-    match prompt_res {
-        Ok(password) => {
-            syslog_log(
-                libc::LOG_DEBUG,
-                &format!("[+{:?}] Password thread: crypt verification starting...", start_time.elapsed()),
-            );
-            if verify_password_hash(&password, shadow_hash) {
-                auth_success.store(true, Ordering::SeqCst);
-                syslog_log(
-                    libc::LOG_INFO,
-                    &format!("[+{:?}] Password thread: verification successful.", start_time.elapsed()),
-                );
+        attempt += 1;
+
+        syslog_log(
+            libc::LOG_DEBUG,
+            &format!(
+                "[+{:?}] Password thread: prompt starting (attempt {}/{})...",
+                start_time.elapsed(),
+                attempt,
+                max_tries
+            ),
+        );
+        let prompt_res = unsafe {
+            if show_stars && libc::isatty(libc::STDIN_FILENO) != 0 {
+                read_password_with_stars("Password: ")
             } else {
-                syslog_log(
-                    libc::LOG_WARNING,
-                    &format!("[+{:?}] Password thread: verification failed.", start_time.elapsed()),
-                );
+                prompt_password(pamh, "Password: ")
             }
-            auth_finished.store(true, Ordering::SeqCst);
+        };
+        syslog_log(
+            libc::LOG_DEBUG,
+            &format!("[+{:?}] Password thread: prompt returned.", start_time.elapsed()),
+        );
+
+        if auth_finished.load(Ordering::SeqCst) {
+            break;
         }
-        Err(err) => {
-            syslog_log(
-                libc::LOG_DEBUG,
-                &format!(
-                    "[+{:?}] Password thread: prompt interrupted or failed: {}",
-                    start_time.elapsed(),
-                    err
-                ),
-            );
-            auth_finished.store(true, Ordering::SeqCst);
+
+        match prompt_res {
+            Ok(password) => {
+                syslog_log(
+                    libc::LOG_DEBUG,
+                    &format!("[+{:?}] Password thread: crypt verification starting...", start_time.elapsed()),
+                );
+                if verify_password_hash(&password, shadow_hash) {
+                    auth_success.store(true, Ordering::SeqCst);
+                    auth_finished.store(true, Ordering::SeqCst);
+                    syslog_log(
+                        libc::LOG_INFO,
+                        &format!("[+{:?}] Password thread: verification successful.", start_time.elapsed()),
+                    );
+                    break;
+                } else {
+                    syslog_log(
+                        libc::LOG_WARNING,
+                        &format!(
+                            "[+{:?}] Password thread: verification failed (attempt {}/{}).",
+                            start_time.elapsed(),
+                            attempt,
+                            max_tries
+                        ),
+                    );
+                    if attempt < max_tries {
+                        // Print password failure message to user
+                        if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+                            use std::io::Write;
+                            eprint!("\r\x1b[2K\x1b[31mPassword incorrect.\x1b[0m\n");
+                            let _ = std::io::stderr().flush();
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                syslog_log(
+                    libc::LOG_DEBUG,
+                    &format!(
+                        "[+{:?}] Password thread: prompt interrupted or failed: {}",
+                        start_time.elapsed(),
+                        err
+                    ),
+                );
+                break;
+            }
         }
     }
+
+    auth_finished.store(true, Ordering::SeqCst);
 }
 
 #[no_mangle]
@@ -733,6 +768,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(
                 &auth_finished,
                 &pw_thread_id,
                 show_stars,
+                max_tries,
                 start_time,
             );
         });
