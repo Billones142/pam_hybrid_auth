@@ -44,7 +44,7 @@ fi
 # Setup temporary PAM config
 sudo bash -c "cat > $PAM_CONF_PATH" <<EOF
 # PAM configuration for testing pam_password_fingerprint
-auth required $PAM_MODULE_PATH $SHOW_STARS_ARG
+auth required $PAM_MODULE_PATH $SHOW_STARS_ARG tries=4
 account required pam_permit.so
 EOF
 
