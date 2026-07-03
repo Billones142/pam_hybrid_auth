@@ -88,6 +88,21 @@ Example configuration (using different attempts limit for each method):
 auth sufficient pam_password_fingerprint.so show_stars password_tries=3 fingerprint_tries=5
 ```
 
+### Recommended Sudoers Configuration
+
+By default, `sudo` implements its own retry loop (typically retrying 3 times). When using this module, this can cause the attempts limit to multiply (e.g. 3 retries of 3 password attempts each).
+
+To delegate all attempt limits and prompt cancellations (such as immediate exit on `Ctrl+C` or limit exhaustion) entirely to this module, it is recommended to configure `sudo` to only try once:
+
+1. Open the sudoers configuration:
+   ```bash
+   sudo visudo
+   ```
+2. Add the following line:
+   ```sudoers
+   Defaults passwd_tries=1
+   ```
+
 ---
 
 ## Advanced UX & Security Features
