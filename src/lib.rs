@@ -510,10 +510,10 @@ async fn run_fingerprint_auth(
 
     // Clean up
     if started {
-        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(50), device.verify_stop()).await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(10), device.verify_stop()).await;
     }
     if claimed {
-        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(50), device.release()).await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(10), device.release()).await;
     }
 
     res
